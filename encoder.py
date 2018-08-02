@@ -18,12 +18,9 @@ class EncoderRNN(nn.Module):
         self.gru = nn.GRU(hidden_size, hidden_size, n_layers, batch_first=True)
 
     def forward(self, word_inputs, hidden):
-        seq_len = len(word_inputs)
-        embedded = self.embedding(word_inputs).view(1, seq_len, -1)
+        embedded = self.embedding(word_inputs)
         output, hidden = self.gru(embedded, hidden)
         return output, hidden
 
-    def init_hidden(self):
-        hidden = Variable(torch.zeros(self.n_layers, 1, self.hidden_size))
-        hidden = hidden.to(opt.device)
-        return hidden
+    def init_hidden(self, batch_size):
+        return Variable(torch.zeros(self.n_layers, batch_size, self.hidden_size)).to(opt.device)

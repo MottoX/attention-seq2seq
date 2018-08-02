@@ -22,13 +22,14 @@ class Attn(nn.Module):
             self.other = nn.Parameter(torch.FloatTensor(hidden_size))
 
     def forward(self, hidden, encoder_outputs):
-        seq_len = len(encoder_outputs)
-        attn_energies = Variable(torch.zeros(seq_len)).to(opt.device)
+        batch_size = encoder_outputs.size(0)
+        seq_len = encoder_outputs.size(1)
+        attn_energies = torch.zeros(batch_size, seq_len).to(opt.device)
 
         for i in range(seq_len):
-            attn_energies[i] = self.score(hidden, encoder_outputs[i])
+            attn_energies[:, i] = self.score(hidden[:, 0], encoder_outputs[:, i])
 
-        return F.softmax(attn_energies, dim=0).unsqueeze(0)
+        return F.softmax(attn_energies, dim=1)
 
     def score(self, hidden, encoder_output):
 
@@ -38,13 +39,13 @@ class Attn(nn.Module):
 
         elif self.method == 'general':
             energy = self.attn(encoder_output)
-            energy = hidden.dot(energy)
+            energy = torch.bmm(hidden.unsqueeze(1), energy.unsqueeze(2)).view(-1)
             return energy
 
         elif self.method == 'concat':
-            energy = self.attn(torch.cat((hidden, encoder_output)))
-            energy = self.other.dot(energy)
-            return energy
+            energy = self.attn(torch.cat((hidden, encoder_output), 1))
+            energy = torch.mm(energy, self.other.unsqueeze(1))
+            return energy.squeeze(1)
 
 
 class AttnDecoderRNN(nn.Module):
@@ -65,20 +66,18 @@ class AttnDecoderRNN(nn.Module):
         self.attn = Attn(attn_model, hidden_size)
 
     def forward(self, word_input, last_context, last_hidden, encoder_outputs):
-        word_embedded = self.embedding(word_input).view(1, 1, -1)
+        word_embedded = self.embedding(word_input)
 
         # use (last target word or last predicated word) and last context as current input
-        rnn_input = torch.cat((word_embedded, last_context.unsqueeze(0)), 2)
+        rnn_input = torch.cat((word_embedded, last_context), 1).unsqueeze(1)
         rnn_output, hidden = self.gru(rnn_input, last_hidden)
 
-        attn_weights = self.attn(rnn_output.view(-1), encoder_outputs.squeeze(0))
+        attn_weights = self.attn(rnn_output, encoder_outputs)
 
-        context = torch.mm(attn_weights, encoder_outputs.squeeze(0))
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
 
-        rnn_output = rnn_output.squeeze(0)
+        output = F.log_softmax(self.out(torch.cat((rnn_output, context), 2)), dim=2)
 
-        # 1 x hidden_size -> hidden_size
+        output = output.squeeze(1)
         context = context.squeeze(1)
-        output = F.log_softmax(self.out(torch.cat((rnn_output, context), 1)), dim=1)
-
         return output, context, hidden, attn_weights

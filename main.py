@@ -96,6 +96,7 @@ from io import open
 import matplotlib
 import torch
 import torch.nn as nn
+import torch.utils.data
 from torch import optim
 from torch.autograd import Variable
 
@@ -159,8 +160,8 @@ class Lang:
         self.name = name
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "SOS", 1: "EOS"}
-        self.n_words = 2  # Count SOS and EOS
+        self.index2word = {0: "SOS", 1: "EOS", 2: "PAD"}
+        self.n_words = 3
 
     def addSentence(self, sentence):
         for word in sentence.split(' '):
@@ -349,13 +350,13 @@ def indexesFromSentence(lang, sentence):
 def tensorFromSentence(lang, sentence):
     indexes = indexesFromSentence(lang, sentence)
     indexes.append(opt.EOS_token)
-    return torch.tensor(indexes, dtype=torch.long, device=opt.device).view(-1, 1)
+    indexes.extend([opt.PAD_token] * (MAX_LENGTH - len(indexes)))
+    return torch.tensor(indexes, dtype=torch.long, device=opt.device);
 
 
-def tensorsFromPair(pair):
-    input_tensor = tensorFromSentence(input_lang, pair[0])
-    target_tensor = tensorFromSentence(output_lang, pair[1])
-    return (input_tensor, target_tensor)
+def tensorsFromPairs(pairs):
+    return list(
+        map(lambda pair: (tensorFromSentence(input_lang, pair[0]), tensorFromSentence(output_lang, pair[1])), pairs))
 
 
 ######################################################################
@@ -390,22 +391,23 @@ teacher_forcing_ratio = 0.5
 
 def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, decoder_optimizer,
           criterion):
-    encoder_hidden = encoder.init_hidden()
+    batch_size = input_tensor.size(0)
+    encoder_hidden = encoder.init_hidden(batch_size)
 
     encoder_optimizer.zero_grad()
     decoder_optimizer.zero_grad()
 
-    target_length = target_tensor.size(0)
+    target_length = target_tensor.size(1)
 
     loss = 0
 
     encoder_outputs, encoder_hidden = encoder(input_tensor, encoder_hidden)
 
-    decoder_input = torch.tensor([[opt.SOS_token]], device=opt.device)
+    decoder_input = torch.tensor(batch_size * [opt.SOS_token], device=opt.device)
 
     decoder_hidden = encoder_hidden
 
-    decoder_context = Variable(torch.zeros(1, hidden_size)).to(opt.device)
+    decoder_context = Variable(torch.zeros(batch_size, hidden_size)).to(opt.device)
 
     use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
 
@@ -414,8 +416,8 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
         for di in range(target_length):
             decoder_output, decoder_context, decoder_hidden, decoder_attention = decoder(
                 decoder_input, decoder_context, decoder_hidden, encoder_outputs)
-            loss += criterion(decoder_output, target_tensor[di])
-            decoder_input = target_tensor[di]  # Teacher forcing
+            loss += criterion(decoder_output, target_tensor[:, di])
+            decoder_input = target_tensor[:, di]  # Teacher forcing
 
     else:
         # Without teacher forcing: use its own predictions as the next input
@@ -425,9 +427,7 @@ def train(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, deco
             topv, topi = decoder_output.topk(1)
             decoder_input = topi.squeeze().detach()  # detach from history as input
 
-            loss += criterion(decoder_output, target_tensor[di])
-            if decoder_input.item() == opt.EOS_token:
-                break
+            loss += criterion(decoder_output, target_tensor[:, di])
 
     loss.backward()
 
@@ -472,40 +472,23 @@ def timeSince(since, percent):
 # of examples, time so far, estimated time) and average loss.
 #
 
-def trainIters(encoder, decoder, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
-    start = time.time()
-    plot_losses = []
-    print_loss_total = 0  # Reset every print_every
-    plot_loss_total = 0  # Reset every plot_every
+def trainIters(encoder, decoder, epochs, train_loader, learning_rate=0.1):
+    encoder_optimizer = optim.SGD(filter(lambda x: x.requires_grad, encoder.parameters()),
+                                  lr=learning_rate)
+    decoder_optimizer = optim.SGD(filter(lambda x: x.requires_grad, decoder.parameters()),
+                                  lr=learning_rate)
 
-    encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
-    training_pairs = [tensorsFromPair(random.choice(pairs))
-                      for _ in range(n_iters)]
+    # data loader
     criterion = nn.NLLLoss()
 
-    for iter in range(1, n_iters + 1):
-        training_pair = training_pairs[iter - 1]
-        input_tensor = training_pair[0]
-        target_tensor = training_pair[1]
+    for epoch in range(epochs):
+        print_loss_total = 0
+        for batch_x, batch_y in train_loader:
+            loss = train(batch_x, batch_y, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion)
+            print_loss_total += loss
 
-        loss = train(input_tensor, target_tensor, encoder,
-                     decoder, encoder_optimizer, decoder_optimizer, criterion)
-        print_loss_total += loss
-        plot_loss_total += loss
-
-        if iter % print_every == 0:
-            print_loss_avg = print_loss_total / print_every
-            print_loss_total = 0
-            print('%s (%d %d%%) %.4f' % (timeSince(start, iter / n_iters),
-                                         iter, iter / n_iters * 100, print_loss_avg))
-
-        if iter % plot_every == 0:
-            plot_loss_avg = plot_loss_total / plot_every
-            plot_losses.append(plot_loss_avg)
-            plot_loss_total = 0
-
-    showPlot(plot_losses)
+        print('epochs: ' + str(epoch))
+        print('total loss: ' + str(print_loss_total))
 
 
 ######################################################################
@@ -544,17 +527,11 @@ def showPlot(points):
 def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
     with torch.no_grad():
         input_tensor = tensorFromSentence(input_lang, sentence)
-        input_length = input_tensor.size()[0]
-        encoder_hidden = encoder.init_hidden()
+        encoder_hidden = encoder.init_hidden(1)
 
-        encoder_outputs = torch.zeros(max_length, encoder.hidden_size, device=opt.device)
+        encoder_outputs, encoder_hidden = encoder(input_tensor.unsqueeze(0), encoder_hidden)
 
-        for ei in range(input_length):
-            encoder_output, encoder_hidden = encoder(input_tensor[ei],
-                                                     encoder_hidden)
-            encoder_outputs[ei] += encoder_output[0, 0]
-
-        decoder_input = torch.tensor([[opt.SOS_token]], device=opt.device)  # SOS
+        decoder_input = torch.tensor([opt.SOS_token], device=opt.device)  # SOS
 
         decoder_hidden = encoder_hidden
         decoder_context = Variable(torch.zeros(1, hidden_size)).to(opt.device)
@@ -570,10 +547,13 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
             if topi.item() == opt.EOS_token:
                 decoded_words.append('<EOS>')
                 break
+            elif topi.item() == opt.PAD_token:
+                decoded_words.append('<PAD>')
+                break
             else:
                 decoded_words.append(output_lang.index2word[topi.item()])
 
-            decoder_input = topi.squeeze().detach()
+            decoder_input = topi.squeeze(0).detach()
 
         return decoded_words, decoder_attentions[:di + 1]
 
@@ -583,71 +563,6 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
 # input, target, and output to make some subjective quality judgements:
 #
 
-def evaluateRandomly(encoder, decoder, n=10):
-    for i in range(n):
-        pair = random.choice(pairs)
-        print('>', pair[0])
-        print('=', pair[1])
-        output_words, attentions = evaluate(encoder, decoder, pair[0])
-        output_sentence = ' '.join(output_words)
-        print('<', output_sentence)
-        print('')
-
-
-######################################################################
-# Training and Evaluating
-# =======================
-#
-# With all these helper functions in place (it looks like extra work, but
-# it makes it easier to run multiple experiments) we can actually
-# initialize a network and start training.
-#
-# Remember that the input sentences were heavily filtered. For this small
-# dataset we can use relatively small networks of 256 hidden nodes and a
-# single GRU layer. After about 40 minutes on a MacBook CPU we'll get some
-# reasonable results.
-#
-# .. Note::
-#    If you run this notebook you can train, interrupt the kernel,
-#    evaluate, and continue training later. Comment out the lines where the
-#    encoder and decoder are initialized and run ``trainIters`` again.
-#
-
-hidden_size = opt.hidden_size
-encoder1 = EncoderRNN(input_lang.n_words, hidden_size, n_layers=opt.n_layers).to(opt.device)
-attn_decoder1 = AttnDecoderRNN(opt.attn_model, hidden_size, output_lang.n_words,
-                               n_layers=opt.n_layers, dropout_p=opt.dropout_p).to(opt.device)
-
-trainIters(encoder1, attn_decoder1, opt.n_iters, print_every=5000)
-
-######################################################################
-#
-
-evaluateRandomly(encoder1, attn_decoder1)
-
-######################################################################
-# Visualizing Attention
-# ---------------------
-#
-# A useful property of the attention mechanism is its highly interpretable
-# outputs. Because it is used to weight specific encoder outputs of the
-# input sequence, we can imagine looking where the network is focused most
-# at each time step.
-#
-# You could simply run ``plt.matshow(attentions)`` to see attention output
-# displayed as a matrix, with the columns being input steps and rows being
-# output steps:
-#
-
-output_words, attentions = evaluate(
-    encoder1, attn_decoder1, "je suis trop froid .")
-plt.matshow(attentions.numpy())
-
-
-######################################################################
-# For a better viewing experience we will do the extra work of adding axes
-# and labels:
-#
 
 def showAttention(input_sentence, output_words, attentions):
     # Set up figure with colorbar
@@ -679,10 +594,84 @@ def evaluateAndShowAttention(input_sentence):
 
 plt.interactive(False)
 
-evaluateAndShowAttention("elle a cinq ans de moins que moi .")
 
-evaluateAndShowAttention("elle est trop petit .")
+def evaluateRandomly(encoder, decoder, test_pairs, n=10):
+    for i in range(n):
+        pair = random.choice(test_pairs)
+        print('>', pair[0])
+        print('=', pair[1])
+        output_words, attentions = evaluate(encoder, decoder, pair[0])
+        output_sentence = ' '.join(output_words)
+        print('<', output_sentence)
+        print('')
+        evaluateAndShowAttention(pair[0])
 
-evaluateAndShowAttention("je ne crains pas de mourir .")
 
-evaluateAndShowAttention("c est un jeune directeur plein de talent .")
+######################################################################
+# Training and Evaluating
+# =======================
+#
+# With all these helper functions in place (it looks like extra work, but
+# it makes it easier to run multiple experiments) we can actually
+# initialize a network and start training.
+#
+# Remember that the input sentences were heavily filtered. For this small
+# dataset we can use relatively small networks of 256 hidden nodes and a
+# single GRU layer. After about 40 minutes on a MacBook CPU we'll get some
+# reasonable results.
+#
+# .. Note::
+#    If you run this notebook you can train, interrupt the kernel,
+#    evaluate, and continue training later. Comment out the lines where the
+#    encoder and decoder are initialized and run ``trainIters`` again.
+#
+
+hidden_size = opt.hidden_size
+encoder1 = EncoderRNN(input_lang.n_words, hidden_size, n_layers=opt.n_layers).to(opt.device)
+attn_decoder1 = AttnDecoderRNN(opt.attn_model, hidden_size, output_lang.n_words,
+                               n_layers=opt.n_layers, dropout_p=opt.dropout_p).to(opt.device)
+
+tensor_pairs = tensorsFromPairs(pairs)
+train_num = int(opt.train_percent * len(tensor_pairs))
+train_loader = torch.utils.data.DataLoader(tensor_pairs[:train_num], batch_size=opt.batch_size, shuffle=True)
+# test_loader = torch.utils.data.DataLoader(tensor_pairs[train_num:], batch_size=opt.batch_size, shuffle=True)
+
+trainIters(encoder1, attn_decoder1, opt.n_iters, train_loader)
+
+######################################################################
+#
+
+evaluateRandomly(encoder1, attn_decoder1, pairs[train_num:])
+
+######################################################################
+# Visualizing Attention
+# ---------------------
+#
+# A useful property of the attention mechanism is its highly interpretable
+# outputs. Because it is used to weight specific encoder outputs of the
+# input sequence, we can imagine looking where the network is focused most
+# at each time step.
+#
+# You could simply run ``plt.matshow(attentions)`` to see attention output
+# displayed as a matrix, with the columns being input steps and rows being
+# output steps:
+#
+
+output_words, attentions = evaluate(
+    encoder1, attn_decoder1, "je suis trop froid .")
+plt.matshow(attentions.numpy())
+
+
+######################################################################
+# For a better viewing experience we will do the extra work of adding axes
+# and labels:
+#
+
+
+# evaluateAndShowAttention("elle a cinq ans de moins que moi .")
+#
+# evaluateAndShowAttention("elle est trop petit .")
+#
+# evaluateAndShowAttention("je ne crains pas de mourir .")
+#
+# evaluateAndShowAttention("c est un jeune directeur plein de talent .")
